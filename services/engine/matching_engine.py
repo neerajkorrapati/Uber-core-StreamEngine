@@ -4,6 +4,7 @@ import signal
 import sys
 from dotenv import load_dotenv
 from kafka import KafkaConsumer
+import redis
 
 # Load environment configuration from the root directory
 load_dotenv(dotenv_path="../../.env")
@@ -12,7 +13,15 @@ KAFKA_BROKER = os.getenv("KAFKA_BROKER_URL", "localhost:19092")
 TOPIC_NAME = os.getenv("TELEMETRY_TOPIC", "driver-telemetry")
 GROUP_ID = os.getenv("CONSUMER_GROUP_ID", "uber-matching-processor")
 
-print(f"[BOOT] Initializing Processing Core connecting to Broker: {KAFKA_BROKER}")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+
+print(f"[BOOT] Initializing Processing Core...")
+print(f"       -> Kafka Broker: {KAFKA_BROKER}")
+print(f"       -> Redis State Grid: {REDIS_HOST}:{REDIS_PORT}")
+
+# Initialize our Redis Connection Pool Client
+redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
 # Initialize our Pure-Python Kafka Consumer Group Gateway
 consumer = KafkaConsumer(
@@ -23,37 +32,40 @@ consumer = KafkaConsumer(
     key_deserializer=lambda k: k.decode("utf-8") if k else None,
     auto_offset_reset="latest",
     enable_auto_commit=True,
-    auto_commit_interval_ms=5000  # Commit read markers back to broker every 5 seconds
+    auto_commit_interval_ms=5000
 )
 
 def handle_shutdown(signum, frame):
-    """Gracefully closes the consumer network sockets on system interruption."""
-    print("\n[SHUTDOWN] Signal captured. Committing final offsets and closing consumer connection...")
+    print("\n[SHUTDOWN] Gracefully closing network consumer sockets...")
     consumer.close()
-    print("[SHUTDOWN] Processing core cleanly offline.")
     sys.exit(0)
 
-# Register OS interruption handlers (Ctrl + C)
 signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
 def run_engine_loop():
-    print(f"[RUNNING] Active on Topic: '{TOPIC_NAME}' | Group ID: '{GROUP_ID}'")
-    print("[WAITING] Monitoring partitions for telemetry vectors...")
+    print(f"[RUNNING] Consuming from '{TOPIC_NAME}'. Updating RAM state grid...")
     
-    # Infinite polling loop reading incoming message frames
     for message in consumer:
         payload = message.value
-        partition = message.partition
-        offset = message.offset
-        
-        # Extract individual telemetry vectors
         driver_id = payload.get("driver_id")
-        lat = payload.get("latitude")
-        lon = payload.get("longitude")
-        status = payload.get("status")
         
-        print(f"[PROCESSING] Part: {partition} | Off: {offset} -> {driver_id} is {status} at [{lat}, {lon}]")
+        # Structure a clean state object for our RAM dictionary
+        state_snapshot = {
+            "latitude": payload.get("latitude"),
+            "longitude": payload.get("longitude"),
+            "status": payload.get("status"),
+            "last_updated": payload.get("timestamp")
+        }
+        
+        # HSET key field value -> Updates our Redis Hash dictionary instantly
+        redis_client.hset(
+            name="driver:state",
+            key=driver_id,
+            value=json.dumps(state_snapshot)
+        )
+        
+        print(f"[CACHE UPDATED] Redis Hash -> {driver_id} updated successfully.")
 
 if __name__ == "__main__":
     run_engine_loop()
